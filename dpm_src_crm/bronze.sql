@@ -1,0 +1,34 @@
+-- DPM_SRC_CRM.BRONZE
+-- Mirrored from the live Snowflake account via
+-- GET_DDL('SCHEMA', 'DPM_SRC_CRM.BRONZE', TRUE). Generated, not hand-written:
+-- re-run the dump to refresh rather than editing this file.
+
+create or replace schema DPM_SRC_CRM.BRONZE;
+
+create or replace sequence DPM_SRC_CRM.BRONZE.SEQ_CUSTOMER_ID start with 1 increment by 1 noorder;
+create or replace TABLE DPM_SRC_CRM.BRONZE.CUSTOMERS_RAW (
+	RECORD_ID NUMBER(38,0) autoincrement start 1 increment 1 noorder,
+	RAW_PAYLOAD VARIANT,
+	LOADED_AT TIMESTAMP_NTZ(9) DEFAULT CURRENT_TIMESTAMP()
+)COMMENT='Bronze: raw landed CRM customer records (append-only)'
+;
+create or replace stream DPM_SRC_CRM.BRONZE.CUSTOMERS_RAW_STREAM on table CUSTOMERS_RAW append_only = true;
+create or replace task DPM_SRC_CRM.BRONZE.TASK_BRONZE_TO_SILVER_CUSTOMERS
+	warehouse=DPM_PIPELINE_WH
+	schedule='1 MINUTE'
+	when SYSTEM$STREAM_HAS_DATA('DPM_SRC_CRM.BRONZE.CUSTOMERS_RAW_STREAM')
+	as MERGE INTO DPM_SRC_CRM.SILVER.CUSTOMERS tgt
+USING (
+  SELECT
+    RAW_PAYLOAD:customer_id::NUMBER AS CUSTOMER_ID,
+    RAW_PAYLOAD:full_name::STRING AS FULL_NAME,
+    RAW_PAYLOAD:email::STRING AS EMAIL,
+    RAW_PAYLOAD:signup_date::DATE AS SIGNUP_DATE
+  FROM DPM_SRC_CRM.BRONZE.CUSTOMERS_RAW_STREAM
+  WHERE METADATA$ACTION = 'INSERT'
+) src
+ON tgt.CUSTOMER_ID = src.CUSTOMER_ID
+WHEN MATCHED THEN UPDATE SET
+  FULL_NAME = src.FULL_NAME, EMAIL = src.EMAIL, SIGNUP_DATE = src.SIGNUP_DATE, UPDATED_AT = CURRENT_TIMESTAMP()
+WHEN NOT MATCHED THEN INSERT (CUSTOMER_ID, FULL_NAME, EMAIL, SIGNUP_DATE, UPDATED_AT)
+  VALUES (src.CUSTOMER_ID, src.FULL_NAME, src.EMAIL, src.SIGNUP_DATE, CURRENT_TIMESTAMP());
