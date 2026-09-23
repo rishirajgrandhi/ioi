@@ -17,6 +17,12 @@ DATABASES = [
     "DPM_SRC_INVENTORY",
     "DPM_CUSTOMER_360",
     "DPM_INVENTORY_360",
+    # Added with the loyalty pipeline. These two do not exist in the account
+    # until `snowflake/dpm_src_loyalty/` and `snowflake/dpm_loyalty_360/` have
+    # been deployed; until then the dump skips them with a warning rather than
+    # failing, so the mirror of the other five stays refreshable.
+    "DPM_SRC_LOYALTY",
+    "DPM_LOYALTY_360",
 ]
 
 db = SessionLocal()
