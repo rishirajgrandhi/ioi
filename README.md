@@ -50,23 +50,16 @@ PYTHONPATH=. uv run python ../../ioi/dump_ddl.py ../../ioi
 | `DPM_SRC_CRM` | `BRONZE`, `SILVER` |
 | `DPM_SRC_BILLING` | `BRONZE`, `SILVER` |
 | `DPM_SRC_INVENTORY` | `BRONZE`, `SILVER` |
-| `DPM_CUSTOMER_360` | `GOLD` |
-| `DPM_INVENTORY_360` | `GOLD` |
-| `DPM_SRC_LOYALTY` | `BRONZE`, `SILVER` — **not deployed yet** |
-| `DPM_LOYALTY_360` | `GOLD` — **not deployed yet** |
+| `DPM_SRC_LOYALTY` | `BRONZE`, `SILVER` |
+| `DPM_CUSTOMER_360` | `IDENTITY`, `GOLD`, `BI` |
 
-The last two are in `dump_ddl.py`'s database list but have no files here yet.
-They exist as reviewed intent in `data_pipeline_monitoring/snowflake/` and land
-in this mirror the first time the dump runs after they are deployed; until then
-the dump skips them with a `!!` line and refreshes the other five as usual.
+Four sources into **one** 360, which is the shape a real pipeline has. The
+per-source gold databases (`DPM_INVENTORY_360`, `DPM_LOYALTY_360`) were retired
+from the design on 2026-09-24: three gold databases, one per source, is not a
+data product but three small pipelines wearing one.
 
-They were added because the original five are all the same shape — an
-append-only VARIANT landing table collapsed into entity state by a MERGE — and a
-parity engine tested only against that shape is untested against most of what
-real pipelines do. The loyalty pipeline is deliberately different: a CDC source
-written MERGE-on-PK, a composite daily-snapshot grain, an SCD2 dimension, an
-aggregate gold table, and a loader cursor table. See the header comment on
-`snowflake/dpm_src_loyalty/bronze.sql` for what each one breaks.
+`DPM_INVENTORY_360` still exists in the account and is no longer mirrored here,
+so it will show as drift until it is dropped.
 
 Each database also has an empty `PUBLIC` schema in Snowflake. It holds no
 objects and is not mirrored here.

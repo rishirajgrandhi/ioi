@@ -1,0 +1,32 @@
+-- DPM_SRC_LOYALTY.SILVER
+-- Mirrored from the live Snowflake account via
+-- GET_DDL('SCHEMA', 'DPM_SRC_LOYALTY.SILVER', TRUE). Generated, not hand-written:
+-- re-run the dump to refresh rather than editing this file.
+
+create or replace schema DPM_SRC_LOYALTY.SILVER;
+
+create or replace TABLE DPM_SRC_LOYALTY.SILVER.MEMBERS (
+	MEMBER_KEY NUMBER(38,0) autoincrement start 1 increment 1 noorder,
+	MEMBER_ID NUMBER(38,0) NOT NULL,
+	FULL_NAME VARCHAR(16777216),
+	EMAIL VARCHAR(16777216),
+	TIER VARCHAR(16777216),
+	STATUS VARCHAR(16777216),
+	ENROLLED_DATE DATE,
+	VALID_FROM TIMESTAMP_NTZ(9) NOT NULL,
+	VALID_TO TIMESTAMP_NTZ(9) NOT NULL,
+	IS_CURRENT BOOLEAN NOT NULL,
+	UPDATED_AT TIMESTAMP_NTZ(9)
+)COMMENT='Silver: loyalty members as an SCD2 dimension (one row per member version)'
+;
+create or replace TABLE DPM_SRC_LOYALTY.SILVER.POINTS_DAILY (
+	MEMBER_ID NUMBER(38,0) NOT NULL,
+	SNAPSHOT_DATE DATE NOT NULL,
+	POINTS_EARNED NUMBER(38,0),
+	POINTS_REDEEMED NUMBER(38,0),
+	CHANNEL VARCHAR(16777216),
+	UPDATED_AT TIMESTAMP_NTZ(9)
+)COMMENT='Silver: daily loyalty point series, grain (MEMBER_ID, SNAPSHOT_DATE)'
+;
+create or replace stream DPM_SRC_LOYALTY.SILVER.MEMBERS_STREAM on table MEMBERS;
+create or replace stream DPM_SRC_LOYALTY.SILVER.POINTS_DAILY_STREAM on table POINTS_DAILY;

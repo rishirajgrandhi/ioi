@@ -16,6 +16,128 @@ create or replace TABLE DPM_CUSTOMER_360.GOLD.CUSTOMER_360 (
 	UPDATED_AT TIMESTAMP_NTZ(9)
 )COMMENT='Gold: unified customer 360 view (CRM + Billing)'
 ;
+create or replace TABLE DPM_CUSTOMER_360.GOLD.EMAIL (
+	INDIVIDUAL_ID VARCHAR(16777216) NOT NULL,
+	EMAIL VARCHAR(16777216) NOT NULL,
+	SOURCE_SYSTEM VARCHAR(16777216) NOT NULL,
+	IS_PRIMARY BOOLEAN,
+	UPDATED_AT TIMESTAMP_NTZ(9)
+)COMMENT='Gold: every known address per individual, grain (INDIVIDUAL_ID, EMAIL)'
+;
+create or replace TABLE DPM_CUSTOMER_360.GOLD.INDIVIDUAL (
+	INDIVIDUAL_ID VARCHAR(16777216) NOT NULL,
+	FULL_NAME VARCHAR(16777216),
+	PRIMARY_EMAIL VARCHAR(16777216),
+	SOURCE_SYSTEMS VARCHAR(16777216),
+	CRM_CUSTOMER_ID NUMBER(38,0),
+	LOYALTY_MEMBER_ID NUMBER(38,0),
+	LOYALTY_TIER VARCHAR(16777216),
+	LOYALTY_STATUS VARCHAR(16777216),
+	SIGNUP_DATE DATE,
+	ENROLLED_DATE DATE,
+	UPDATED_AT TIMESTAMP_NTZ(9)
+)COMMENT='Gold: one row per resolved individual'
+;
+create or replace TABLE DPM_CUSTOMER_360.GOLD.LOYALTY_DAILY (
+	INDIVIDUAL_ID VARCHAR(16777216) NOT NULL,
+	SNAPSHOT_DATE DATE NOT NULL,
+	POINTS_EARNED NUMBER(38,0),
+	POINTS_REDEEMED NUMBER(38,0),
+	CHANNEL VARCHAR(16777216),
+	UPDATED_AT TIMESTAMP_NTZ(9)
+)COMMENT='Gold: the daily loyalty series, re-keyed onto the individual'
+;
+create or replace TABLE DPM_CUSTOMER_360.GOLD.PRODUCT (
+	PRODUCT_ID NUMBER(38,0) NOT NULL,
+	PRODUCT_NAME VARCHAR(16777216),
+	CATEGORY VARCHAR(16777216),
+	UNIT_PRICE NUMBER(10,2),
+	WAREHOUSE_ID VARCHAR(16777216),
+	UPDATED_AT TIMESTAMP_NTZ(9)
+)COMMENT='Gold: the product dimension, projected from inventory silver'
+;
+create or replace TABLE DPM_CUSTOMER_360.GOLD.TRANSACTION (
+	TRANSACTION_ID NUMBER(38,0) NOT NULL,
+	INDIVIDUAL_ID VARCHAR(16777216),
+	PRODUCT_ID NUMBER(38,0),
+	AMOUNT NUMBER(12,2),
+	STATUS VARCHAR(16777216),
+	TRANSACTION_DATE DATE,
+	UPDATED_AT TIMESTAMP_NTZ(9)
+)COMMENT='Gold: billing invoices as transactions, keyed to the individual and the product'
+;
+CREATE OR REPLACE PROCEDURE DPM_CUSTOMER_360.GOLD.SP_BACKFILL_GOLD()
+RETURNS VARCHAR
+LANGUAGE SQL
+COMMENT='One-off: loads everything already in silver into gold, which the stream-driven tasks cannot see'
+EXECUTE AS OWNER
+AS '
+DECLARE
+  products INTEGER DEFAULT 0;
+  transactions INTEGER DEFAULT 0;
+  loyalty_days INTEGER DEFAULT 0;
+BEGIN
+  -- Identity first. Every gold table below keys on the cross-reference, so a
+  -- stale one silently drops whichever source it has not yet seen.
+  CALL DPM_CUSTOMER_360.IDENTITY.SP_RESOLVE_IDENTITY();
+
+  MERGE INTO DPM_CUSTOMER_360.GOLD.PRODUCT tgt
+  USING (
+    SELECT PRODUCT_ID, PRODUCT_NAME, CATEGORY, UNIT_PRICE, WAREHOUSE_ID
+    FROM DPM_SRC_INVENTORY.SILVER.PRODUCTS
+  ) src
+  ON tgt.PRODUCT_ID = src.PRODUCT_ID
+  WHEN MATCHED THEN UPDATE SET
+    PRODUCT_NAME = src.PRODUCT_NAME, CATEGORY = src.CATEGORY,
+    UNIT_PRICE = src.UNIT_PRICE, WAREHOUSE_ID = src.WAREHOUSE_ID,
+    UPDATED_AT = CURRENT_TIMESTAMP()
+  WHEN NOT MATCHED THEN INSERT (PRODUCT_ID, PRODUCT_NAME, CATEGORY, UNIT_PRICE, WAREHOUSE_ID, UPDATED_AT)
+    VALUES (src.PRODUCT_ID, src.PRODUCT_NAME, src.CATEGORY, src.UNIT_PRICE, src.WAREHOUSE_ID, CURRENT_TIMESTAMP());
+  products := SQLROWCOUNT;
+
+  MERGE INTO DPM_CUSTOMER_360.GOLD.TRANSACTION tgt
+  USING (
+    SELECT
+        i.INVOICE_ID AS TRANSACTION_ID, x.INDIVIDUAL_ID AS INDIVIDUAL_ID,
+        i.PRODUCT_ID AS PRODUCT_ID, i.AMOUNT AS AMOUNT, i.STATUS AS STATUS,
+        i.INVOICE_DATE AS TRANSACTION_DATE
+    FROM DPM_SRC_BILLING.SILVER.INVOICES i
+    LEFT JOIN DPM_CUSTOMER_360.IDENTITY.INDIVIDUAL_XREF x
+      ON x.SOURCE_SYSTEM = ''CRM'' AND x.SOURCE_ID = TO_VARCHAR(i.CUSTOMER_ID)
+  ) src
+  ON tgt.TRANSACTION_ID = src.TRANSACTION_ID
+  WHEN MATCHED THEN UPDATE SET
+    INDIVIDUAL_ID = src.INDIVIDUAL_ID, PRODUCT_ID = src.PRODUCT_ID, AMOUNT = src.AMOUNT,
+    STATUS = src.STATUS, TRANSACTION_DATE = src.TRANSACTION_DATE, UPDATED_AT = CURRENT_TIMESTAMP()
+  WHEN NOT MATCHED THEN INSERT (TRANSACTION_ID, INDIVIDUAL_ID, PRODUCT_ID, AMOUNT, STATUS, TRANSACTION_DATE, UPDATED_AT)
+    VALUES (src.TRANSACTION_ID, src.INDIVIDUAL_ID, src.PRODUCT_ID, src.AMOUNT, src.STATUS, src.TRANSACTION_DATE, CURRENT_TIMESTAMP());
+  transactions := SQLROWCOUNT;
+
+  MERGE INTO DPM_CUSTOMER_360.GOLD.LOYALTY_DAILY tgt
+  USING (
+    SELECT
+        x.INDIVIDUAL_ID AS INDIVIDUAL_ID, p.SNAPSHOT_DATE AS SNAPSHOT_DATE,
+        p.POINTS_EARNED AS POINTS_EARNED, p.POINTS_REDEEMED AS POINTS_REDEEMED,
+        p.CHANNEL AS CHANNEL
+    FROM DPM_SRC_LOYALTY.SILVER.POINTS_DAILY p
+    JOIN DPM_CUSTOMER_360.IDENTITY.INDIVIDUAL_XREF x
+      ON x.SOURCE_SYSTEM = ''LOYALTY'' AND x.SOURCE_ID = TO_VARCHAR(p.MEMBER_ID)
+    QUALIFY ROW_NUMBER() OVER (
+      PARTITION BY x.INDIVIDUAL_ID, p.SNAPSHOT_DATE ORDER BY p.MEMBER_ID
+    ) = 1
+  ) src
+  ON tgt.INDIVIDUAL_ID = src.INDIVIDUAL_ID AND tgt.SNAPSHOT_DATE = src.SNAPSHOT_DATE
+  WHEN MATCHED THEN UPDATE SET
+    POINTS_EARNED = src.POINTS_EARNED, POINTS_REDEEMED = src.POINTS_REDEEMED,
+    CHANNEL = src.CHANNEL, UPDATED_AT = CURRENT_TIMESTAMP()
+  WHEN NOT MATCHED THEN INSERT (INDIVIDUAL_ID, SNAPSHOT_DATE, POINTS_EARNED, POINTS_REDEEMED, CHANNEL, UPDATED_AT)
+    VALUES (src.INDIVIDUAL_ID, src.SNAPSHOT_DATE, src.POINTS_EARNED, src.POINTS_REDEEMED, src.CHANNEL, CURRENT_TIMESTAMP());
+  loyalty_days := SQLROWCOUNT;
+
+  RETURN ''Backfilled '' || products || '' product(s), '' || transactions
+      || '' transaction(s) and '' || loyalty_days || '' loyalty day(s).'';
+END;
+';
 CREATE OR REPLACE PROCEDURE DPM_CUSTOMER_360.GOLD.SP_GENERATE_DUMMY_DATA("NUM_CUSTOMERS" NUMBER(38,0), "NUM_INVOICES_PER_CUSTOMER" NUMBER(38,0))
 RETURNS VARCHAR
 LANGUAGE SQL
@@ -59,11 +181,237 @@ BEGIN
   RETURN ''Inserted '' || NUM_CUSTOMERS || '' customer(s) into DPM_SRC_CRM.BRONZE.CUSTOMERS_RAW and '' || total_invoices || '' invoice(s) into DPM_SRC_BILLING.BRONZE.INVOICES_RAW. Pipeline tasks (1-minute schedule) will propagate them to SILVER then GOLD.'';
 END;
 ';
+CREATE OR REPLACE PROCEDURE DPM_CUSTOMER_360.GOLD.SP_GENERATE_TEST_DATA("NUM_CUSTOMERS" NUMBER(38,0), "NUM_INVOICES_PER_CUSTOMER" NUMBER(38,0), "NUM_PRODUCTS" NUMBER(38,0), "NUM_LOYALTY_UPDATES" NUMBER(38,0), "NUM_LOYALTY_DELETES" NUMBER(38,0), "NUM_SNAPSHOT_DAYS" NUMBER(38,0))
+RETURNS VARCHAR
+LANGUAGE SQL
+COMMENT='Generates CRM customers, billing invoices, inventory products and loyalty CDC events, with deliberate overlap between CRM and loyalty so identity resolution is exercised'
+EXECUTE AS OWNER
+AS '
+DECLARE
+  i INTEGER DEFAULT 0;
+  j INTEGER DEFAULT 0;
+  new_cust_id INTEGER;
+  new_product_id INTEGER;
+  next_seq INTEGER;
+  product_count INTEGER DEFAULT 0;
+  invoices_written INTEGER DEFAULT 0;
+  members_written INTEGER DEFAULT 0;
+  snapshot_rows INTEGER DEFAULT 0;
+  existing_members INTEGER DEFAULT 0;
+BEGIN
+  -- ---- products first ------------------------------------------------------
+  -- Invoices reference a product, so the dimension has to exist before the
+  -- facts that point at it. Generating them the other way round would make
+  -- every new invoice fail referential integrity for reasons that are the
+  -- generator''s fault rather than the pipeline''s.
+  WHILE (i < NUM_PRODUCTS) DO
+    SELECT DPM_SRC_INVENTORY.BRONZE.SEQ_PRODUCT_ID.NEXTVAL INTO :new_product_id;
+
+    INSERT INTO DPM_SRC_INVENTORY.BRONZE.PRODUCTS_RAW (RAW_PAYLOAD)
+    SELECT OBJECT_CONSTRUCT(
+      ''product_id'', :new_product_id,
+      ''product_name'', ''Product '' || :new_product_id,
+      ''category'', ARRAY_CONSTRUCT(''ELECTRONICS'',''GROCERY'',''APPAREL'',''HOME'')[UNIFORM(0, 3, RANDOM())],
+      ''unit_price'', ROUND(UNIFORM(5, 500, RANDOM()) + UNIFORM(0, 99, RANDOM()) / 100.0, 2),
+      -- Roughly a third land out of stock, which is what the filtered MERGE
+      -- into silver exists to exclude.
+      ''quantity_on_hand'', CASE WHEN UNIFORM(0, 9, RANDOM()) < 3 THEN 0 ELSE UNIFORM(1, 200, RANDOM()) END,
+      ''warehouse_id'', ''WH-'' || UNIFORM(1, 5, RANDOM())
+    );
+    i := i + 1;
+  END WHILE;
+
+  SELECT COUNT(*) INTO :product_count FROM DPM_SRC_INVENTORY.BRONZE.PRODUCTS_RAW;
+
+  -- ---- CRM customers, and their invoices ------------------------------------
+  i := 0;
+  WHILE (i < NUM_CUSTOMERS) DO
+    SELECT DPM_SRC_CRM.BRONZE.SEQ_CUSTOMER_ID.NEXTVAL INTO :new_cust_id;
+
+    INSERT INTO DPM_SRC_CRM.BRONZE.CUSTOMERS_RAW (RAW_PAYLOAD)
+    SELECT OBJECT_CONSTRUCT(
+      ''customer_id'', :new_cust_id,
+      ''full_name'', ''Customer '' || :new_cust_id,
+      ''email'', ''customer'' || :new_cust_id || ''@example.com'',
+      ''signup_date'', TO_VARCHAR(DATEADD(day, -UNIFORM(1, 365, RANDOM()), CURRENT_DATE()))
+    );
+
+    j := 0;
+    WHILE (j < NUM_INVOICES_PER_CUSTOMER) DO
+      INSERT INTO DPM_SRC_BILLING.BRONZE.INVOICES_RAW (RAW_PAYLOAD)
+      SELECT OBJECT_CONSTRUCT(
+        ''invoice_id'', DPM_SRC_BILLING.BRONZE.SEQ_INVOICE_ID.NEXTVAL,
+        ''customer_id'', :new_cust_id,
+        -- Picked from the products that actually exist, so a failing
+        -- referential-integrity check means the pipeline lost the join rather
+        -- than that the generator invented a product id.
+        ''product_id'', (
+          SELECT p.RAW_PAYLOAD:product_id::NUMBER
+          FROM DPM_SRC_INVENTORY.BRONZE.PRODUCTS_RAW p
+          ORDER BY RANDOM() LIMIT 1
+        ),
+        ''amount'', ROUND(UNIFORM(10, 1000, RANDOM()) + UNIFORM(0, 99, RANDOM()) / 100.0, 2),
+        ''status'', ARRAY_CONSTRUCT(''PAID'',''PENDING'',''OVERDUE'')[UNIFORM(0, 2, RANDOM())],
+        ''invoice_date'', TO_VARCHAR(DATEADD(day, -UNIFORM(0, 90, RANDOM()), CURRENT_DATE()))
+      );
+      invoices_written := invoices_written + 1;
+      j := j + 1;
+    END WHILE;
+
+    i := i + 1;
+  END WHILE;
+
+  -- ---- loyalty members, drawn from existing customers -----------------------
+  -- This is the line that makes the identity layer worth having. About half of
+  -- the new customers also enrol in loyalty, under the same email, so the
+  -- resolver has something real to match on.
+  SELECT COALESCE(MAX(SEQ_NO), 0) INTO :next_seq FROM DPM_SRC_LOYALTY.BRONZE.MEMBERS_RAW;
+
+  MERGE INTO DPM_SRC_LOYALTY.BRONZE.MEMBERS_RAW tgt
+  USING (
+    SELECT
+        c.RAW_PAYLOAD:customer_id::NUMBER AS MEMBER_ID,
+        ''I'' AS OP,
+        :next_seq + ROW_NUMBER() OVER (ORDER BY c.RECORD_ID) AS SEQ_NO,
+        OBJECT_CONSTRUCT(
+          ''member_id'', c.RAW_PAYLOAD:customer_id::NUMBER,
+          ''full_name'', c.RAW_PAYLOAD:full_name::STRING,
+          -- The same address the CRM holds. Identity resolution matches on the
+          -- normalised form, so this is what links the two source records.
+          ''email'', c.RAW_PAYLOAD:email::STRING,
+          ''tier'', ARRAY_CONSTRUCT(''BRONZE'',''SILVER'',''GOLD'',''PLATINUM'')[UNIFORM(0, 3, RANDOM())],
+          ''status'', ''ACTIVE'',
+          ''enrolled_date'', TO_VARCHAR(CURRENT_DATE())
+        ) AS RAW_PAYLOAD
+    FROM DPM_SRC_CRM.BRONZE.CUSTOMERS_RAW c
+    WHERE NOT EXISTS (
+      SELECT 1 FROM DPM_SRC_LOYALTY.BRONZE.MEMBERS_RAW m
+      WHERE m.MEMBER_ID = c.RAW_PAYLOAD:customer_id::NUMBER
+    )
+      AND UNIFORM(0, 1, RANDOM()) = 1
+  ) src
+  ON tgt.MEMBER_ID = src.MEMBER_ID
+  WHEN NOT MATCHED THEN INSERT (MEMBER_ID, OP, SEQ_NO, RAW_PAYLOAD)
+    VALUES (src.MEMBER_ID, src.OP, src.SEQ_NO, src.RAW_PAYLOAD);
+
+  members_written := SQLROWCOUNT;
+  SELECT COUNT(*) INTO :existing_members FROM DPM_SRC_LOYALTY.BRONZE.MEMBERS_RAW;
+  SELECT COALESCE(MAX(SEQ_NO), 0) INTO :next_seq FROM DPM_SRC_LOYALTY.BRONZE.MEMBERS_RAW;
+
+  -- ---- loyalty CDC updates --------------------------------------------------
+  IF (existing_members > 0) THEN
+    i := 0;
+    WHILE (i < NUM_LOYALTY_UPDATES) DO
+      next_seq := next_seq + 1;
+      MERGE INTO DPM_SRC_LOYALTY.BRONZE.MEMBERS_RAW tgt
+      USING (
+        SELECT
+            m.MEMBER_ID AS MEMBER_ID, ''U'' AS OP, :next_seq AS SEQ_NO,
+            OBJECT_INSERT(
+              OBJECT_INSERT(m.RAW_PAYLOAD, ''tier'',
+                ARRAY_CONSTRUCT(''BRONZE'',''SILVER'',''GOLD'',''PLATINUM'')[UNIFORM(0, 3, RANDOM())], TRUE),
+              ''status'',
+              ARRAY_CONSTRUCT(''ACTIVE'',''ACTIVE'',''LAPSED'',''SUSPENDED'')[UNIFORM(0, 3, RANDOM())], TRUE
+            ) AS RAW_PAYLOAD
+        FROM DPM_SRC_LOYALTY.BRONZE.MEMBERS_RAW m
+        WHERE m.OP <> ''D''
+        ORDER BY RANDOM() LIMIT 1
+      ) src
+      ON tgt.MEMBER_ID = src.MEMBER_ID
+      WHEN MATCHED THEN UPDATE SET
+        OP = src.OP, SEQ_NO = src.SEQ_NO, RAW_PAYLOAD = src.RAW_PAYLOAD,
+        ETL_UPDATED_AT = CURRENT_TIMESTAMP();
+      i := i + 1;
+    END WHILE;
+
+    -- ---- loyalty CDC deletes ------------------------------------------------
+    -- The tombstone path. Without one the OP <> ''D'' filter the MERGE-on-PK
+    -- design turns on is never exercised, and a filter nobody exercises is a
+    -- filter nobody knows is wrong.
+    i := 0;
+    WHILE (i < NUM_LOYALTY_DELETES) DO
+      next_seq := next_seq + 1;
+      MERGE INTO DPM_SRC_LOYALTY.BRONZE.MEMBERS_RAW tgt
+      USING (
+        SELECT m.MEMBER_ID AS MEMBER_ID, ''D'' AS OP, :next_seq AS SEQ_NO
+        FROM DPM_SRC_LOYALTY.BRONZE.MEMBERS_RAW m
+        WHERE m.OP <> ''D''
+        ORDER BY RANDOM() LIMIT 1
+      ) src
+      ON tgt.MEMBER_ID = src.MEMBER_ID
+      WHEN MATCHED THEN UPDATE SET
+        -- The payload is left alone. A delete says the entity is gone, not
+        -- that its attributes changed.
+        OP = src.OP, SEQ_NO = src.SEQ_NO, ETL_UPDATED_AT = CURRENT_TIMESTAMP();
+      i := i + 1;
+    END WHILE;
+  END IF;
+
+  -- ---- daily point snapshots -----------------------------------------------
+  INSERT INTO DPM_SRC_LOYALTY.BRONZE.POINTS_SNAPSHOT_RAW (MEMBER_ID, SNAPSHOT_DATE, RAW_PAYLOAD)
+  SELECT
+    m.MEMBER_ID,
+    d.SNAPSHOT_DATE,
+    OBJECT_CONSTRUCT(
+      ''member_id'', m.MEMBER_ID,
+      ''snapshot_date'', TO_VARCHAR(d.SNAPSHOT_DATE),
+      ''points_earned'', UNIFORM(0, 500, RANDOM()),
+      ''points_redeemed'', UNIFORM(0, 200, RANDOM()),
+      ''channel'', ARRAY_CONSTRUCT(''APP'',''WEB'',''STORE'',''PARTNER'')[UNIFORM(0, 3, RANDOM())]
+    )
+  FROM DPM_SRC_LOYALTY.BRONZE.MEMBERS_RAW m
+  CROSS JOIN (
+    SELECT DATEADD(day, -SEQ4(), CURRENT_DATE()) AS SNAPSHOT_DATE
+    FROM TABLE(GENERATOR(ROWCOUNT => 400))
+    -- Bound with `:`, not bare. A procedure argument referenced inside a SQL
+    -- statement is a bind variable; without the colon Snowflake resolves it as
+    -- a column name and the whole INSERT fails to compile.
+    QUALIFY ROW_NUMBER() OVER (ORDER BY SNAPSHOT_DATE DESC) <= :NUM_SNAPSHOT_DAYS
+  ) d
+  WHERE m.OP <> ''D''
+    -- Idempotent per (member, day). Re-running must not double the series, or
+    -- the reconciliation against BI fails on the generator rather than on the
+    -- pipeline.
+    AND NOT EXISTS (
+      SELECT 1 FROM DPM_SRC_LOYALTY.BRONZE.POINTS_SNAPSHOT_RAW p
+      WHERE p.MEMBER_ID = m.MEMBER_ID AND p.SNAPSHOT_DATE = d.SNAPSHOT_DATE
+    );
+
+  snapshot_rows := SQLROWCOUNT;
+
+  -- ---- loader accounting ----------------------------------------------------
+  MERGE INTO DPM_SRC_LOYALTY.BRONZE.CURSOR_STATE tgt
+  USING (
+    SELECT ''members'' AS TABLE_NAME, :members_written AS N
+    UNION ALL SELECT ''points_snapshot'', :snapshot_rows
+  ) src
+  ON tgt.TABLE_NAME = src.TABLE_NAME
+  WHEN MATCHED THEN UPDATE SET
+    LAST_CURSOR = TO_VARCHAR(CURRENT_DATE()),
+    PAGES_LOADED = COALESCE(tgt.PAGES_LOADED, 0) + 1,
+    ROWS_LOADED = COALESCE(tgt.ROWS_LOADED, 0) + src.N,
+    STATUS = ''COMPLETED'', UPDATED_AT = CURRENT_TIMESTAMP()
+  WHEN NOT MATCHED THEN INSERT (TABLE_NAME, LAST_CURSOR, PAGES_LOADED, ROWS_LOADED, STATUS, UPDATED_AT)
+    VALUES (src.TABLE_NAME, TO_VARCHAR(CURRENT_DATE()), 1, src.N, ''COMPLETED'', CURRENT_TIMESTAMP());
+
+  RETURN ''Wrote '' || NUM_PRODUCTS || '' product(s), '' || NUM_CUSTOMERS || '' customer(s), ''
+      || invoices_written || '' invoice(s), '' || members_written || '' loyalty enrolment(s) and ''
+      || snapshot_rows || '' point snapshot row(s).'';
+END;
+';
+create or replace stream DPM_CUSTOMER_360.GOLD.INDIVIDUAL_STREAM on table INDIVIDUAL;
+create or replace stream DPM_CUSTOMER_360.GOLD.LOYALTY_DAILY_STREAM on table LOYALTY_DAILY;
+create or replace stream DPM_CUSTOMER_360.GOLD.TRANSACTION_STREAM on table TRANSACTION;
 create or replace task DPM_CUSTOMER_360.GOLD.TASK_GENERATE_DUMMY_DATA
 	warehouse=DPM_PIPELINE_WH
 	schedule='60 MINUTE'
 	COMMENT='Hourly generator of dummy bronze data to keep the bronze->silver->gold test pipeline exercised'
 	as CALL DPM_CUSTOMER_360.GOLD.SP_GENERATE_DUMMY_DATA(3, 2);
+create or replace task DPM_CUSTOMER_360.GOLD.TASK_GENERATE_TEST_DATA
+	warehouse=DPM_PIPELINE_WH
+	schedule='60 MINUTE'
+	COMMENT='Hourly test-data generator keeping the whole bronze -> silver -> gold -> BI pipeline exercised'
+	as CALL DPM_CUSTOMER_360.GOLD.SP_GENERATE_TEST_DATA(3, 2, 2, 2, 1, 7);
 create or replace task DPM_CUSTOMER_360.GOLD.TASK_SILVER_TO_GOLD_CUSTOMER_360
 	warehouse=DPM_PIPELINE_WH
 	schedule='1 MINUTE'
@@ -95,3 +443,155 @@ WHEN MATCHED THEN UPDATE SET
   UPDATED_AT = CURRENT_TIMESTAMP()
 WHEN NOT MATCHED THEN INSERT (CUSTOMER_ID, FULL_NAME, EMAIL, SIGNUP_DATE, TOTAL_INVOICES, TOTAL_AMOUNT, LAST_INVOICE_DATE, UPDATED_AT)
   VALUES (src.CUSTOMER_ID, src.FULL_NAME, src.EMAIL, src.SIGNUP_DATE, src.TOTAL_INVOICES, src.TOTAL_AMOUNT, src.LAST_INVOICE_DATE, CURRENT_TIMESTAMP());
+create or replace task DPM_CUSTOMER_360.GOLD.TASK_SILVER_TO_GOLD_EMAIL
+	warehouse=DPM_PIPELINE_WH
+	after DPM_CUSTOMER_360.GOLD.TASK_SILVER_TO_GOLD_INDIVIDUAL
+	as MERGE INTO DPM_CUSTOMER_360.GOLD.EMAIL tgt
+USING (
+  SELECT
+      x.INDIVIDUAL_ID AS INDIVIDUAL_ID,
+      n.NORMALIZED_EMAIL AS EMAIL,
+      n.SOURCE_SYSTEM AS SOURCE_SYSTEM,
+      n.NORMALIZED_EMAIL = MAX(n.NORMALIZED_EMAIL) OVER (PARTITION BY x.INDIVIDUAL_ID) AS IS_PRIMARY
+  FROM DPM_CUSTOMER_360.IDENTITY.NORMALIZE_EMAIL n
+  JOIN DPM_CUSTOMER_360.IDENTITY.INDIVIDUAL_XREF x
+    ON x.SOURCE_SYSTEM = n.SOURCE_SYSTEM AND x.SOURCE_ID = n.SOURCE_ID
+  WHERE n.NORMALIZED_EMAIL IS NOT NULL
+  QUALIFY ROW_NUMBER() OVER (
+    PARTITION BY x.INDIVIDUAL_ID, n.NORMALIZED_EMAIL
+    ORDER BY n.SOURCE_SYSTEM
+  ) = 1
+) src
+ON tgt.INDIVIDUAL_ID = src.INDIVIDUAL_ID AND tgt.EMAIL = src.EMAIL
+WHEN MATCHED THEN UPDATE SET
+  SOURCE_SYSTEM = src.SOURCE_SYSTEM, IS_PRIMARY = src.IS_PRIMARY, UPDATED_AT = CURRENT_TIMESTAMP()
+WHEN NOT MATCHED THEN INSERT (INDIVIDUAL_ID, EMAIL, SOURCE_SYSTEM, IS_PRIMARY, UPDATED_AT)
+  VALUES (src.INDIVIDUAL_ID, src.EMAIL, src.SOURCE_SYSTEM, src.IS_PRIMARY, CURRENT_TIMESTAMP());
+create or replace task DPM_CUSTOMER_360.GOLD.TASK_SILVER_TO_GOLD_INDIVIDUAL
+	warehouse=DPM_PIPELINE_WH
+	schedule='1 MINUTE'
+	as MERGE INTO DPM_CUSTOMER_360.GOLD.INDIVIDUAL tgt
+USING (
+  SELECT
+      x.INDIVIDUAL_ID AS INDIVIDUAL_ID,
+      COALESCE(MAX(c.FULL_NAME), MAX(m.FULL_NAME)) AS FULL_NAME,
+      COALESCE(MAX(c.EMAIL), MAX(m.EMAIL)) AS PRIMARY_EMAIL,
+      LISTAGG(DISTINCT x.SOURCE_SYSTEM, ',') AS SOURCE_SYSTEMS,
+      MAX(c.CUSTOMER_ID) AS CRM_CUSTOMER_ID,
+      MAX(m.MEMBER_ID) AS LOYALTY_MEMBER_ID,
+      MAX(m.TIER) AS LOYALTY_TIER,
+      MAX(m.STATUS) AS LOYALTY_STATUS,
+      MAX(c.SIGNUP_DATE) AS SIGNUP_DATE,
+      MAX(m.ENROLLED_DATE) AS ENROLLED_DATE
+  FROM DPM_CUSTOMER_360.IDENTITY.INDIVIDUAL_XREF x
+  LEFT JOIN DPM_SRC_CRM.SILVER.CUSTOMERS c
+    ON x.SOURCE_SYSTEM = 'CRM' AND TO_VARCHAR(c.CUSTOMER_ID) = x.SOURCE_ID
+  LEFT JOIN DPM_SRC_LOYALTY.SILVER.MEMBERS m
+    ON x.SOURCE_SYSTEM = 'LOYALTY' AND TO_VARCHAR(m.MEMBER_ID) = x.SOURCE_ID
+   -- Current versions only, or the dimension's history fans the join out and
+   -- one member with three versions contributes three times.
+   AND m.IS_CURRENT = TRUE
+  GROUP BY x.INDIVIDUAL_ID
+) src
+ON tgt.INDIVIDUAL_ID = src.INDIVIDUAL_ID
+WHEN MATCHED THEN UPDATE SET
+  FULL_NAME = src.FULL_NAME, PRIMARY_EMAIL = src.PRIMARY_EMAIL,
+  SOURCE_SYSTEMS = src.SOURCE_SYSTEMS, CRM_CUSTOMER_ID = src.CRM_CUSTOMER_ID,
+  LOYALTY_MEMBER_ID = src.LOYALTY_MEMBER_ID, LOYALTY_TIER = src.LOYALTY_TIER,
+  LOYALTY_STATUS = src.LOYALTY_STATUS, SIGNUP_DATE = src.SIGNUP_DATE,
+  ENROLLED_DATE = src.ENROLLED_DATE, UPDATED_AT = CURRENT_TIMESTAMP()
+WHEN NOT MATCHED THEN INSERT (
+  INDIVIDUAL_ID, FULL_NAME, PRIMARY_EMAIL, SOURCE_SYSTEMS, CRM_CUSTOMER_ID,
+  LOYALTY_MEMBER_ID, LOYALTY_TIER, LOYALTY_STATUS, SIGNUP_DATE, ENROLLED_DATE, UPDATED_AT
+) VALUES (
+  src.INDIVIDUAL_ID, src.FULL_NAME, src.PRIMARY_EMAIL, src.SOURCE_SYSTEMS, src.CRM_CUSTOMER_ID,
+  src.LOYALTY_MEMBER_ID, src.LOYALTY_TIER, src.LOYALTY_STATUS, src.SIGNUP_DATE, src.ENROLLED_DATE,
+  CURRENT_TIMESTAMP()
+);
+create or replace task DPM_CUSTOMER_360.GOLD.TASK_SILVER_TO_GOLD_LOYALTY_DAILY
+	warehouse=DPM_PIPELINE_WH
+	schedule='1 MINUTE'
+	when SYSTEM$STREAM_HAS_DATA('DPM_SRC_LOYALTY.SILVER.POINTS_DAILY_STREAM')
+	as MERGE INTO DPM_CUSTOMER_360.GOLD.LOYALTY_DAILY tgt
+USING (
+  SELECT
+      x.INDIVIDUAL_ID AS INDIVIDUAL_ID,
+      p.SNAPSHOT_DATE AS SNAPSHOT_DATE,
+      p.POINTS_EARNED AS POINTS_EARNED,
+      p.POINTS_REDEEMED AS POINTS_REDEEMED,
+      p.CHANNEL AS CHANNEL
+  FROM DPM_SRC_LOYALTY.SILVER.POINTS_DAILY p
+  JOIN DPM_CUSTOMER_360.IDENTITY.INDIVIDUAL_XREF x
+    ON x.SOURCE_SYSTEM = 'LOYALTY' AND x.SOURCE_ID = TO_VARCHAR(p.MEMBER_ID)
+  WHERE p.MEMBER_ID IN (SELECT MEMBER_ID FROM DPM_SRC_LOYALTY.SILVER.POINTS_DAILY_STREAM)
+  -- Two loyalty members resolving to one individual would otherwise land two
+  -- rows for the same (individual, day) and break the declared grain.
+  QUALIFY ROW_NUMBER() OVER (
+    PARTITION BY x.INDIVIDUAL_ID, p.SNAPSHOT_DATE
+    ORDER BY p.MEMBER_ID
+  ) = 1
+) src
+ON tgt.INDIVIDUAL_ID = src.INDIVIDUAL_ID AND tgt.SNAPSHOT_DATE = src.SNAPSHOT_DATE
+WHEN MATCHED THEN UPDATE SET
+  POINTS_EARNED = src.POINTS_EARNED, POINTS_REDEEMED = src.POINTS_REDEEMED,
+  CHANNEL = src.CHANNEL, UPDATED_AT = CURRENT_TIMESTAMP()
+WHEN NOT MATCHED THEN INSERT (
+  INDIVIDUAL_ID, SNAPSHOT_DATE, POINTS_EARNED, POINTS_REDEEMED, CHANNEL, UPDATED_AT
+) VALUES (
+  src.INDIVIDUAL_ID, src.SNAPSHOT_DATE, src.POINTS_EARNED, src.POINTS_REDEEMED,
+  src.CHANNEL, CURRENT_TIMESTAMP()
+);
+create or replace task DPM_CUSTOMER_360.GOLD.TASK_SILVER_TO_GOLD_PRODUCT
+	warehouse=DPM_PIPELINE_WH
+	schedule='1 MINUTE'
+	when SYSTEM$STREAM_HAS_DATA('DPM_SRC_INVENTORY.SILVER.PRODUCTS_STREAM')
+	as MERGE INTO DPM_CUSTOMER_360.GOLD.PRODUCT tgt
+USING (
+  SELECT
+      p.PRODUCT_ID AS PRODUCT_ID,
+      p.PRODUCT_NAME AS PRODUCT_NAME,
+      p.CATEGORY AS CATEGORY,
+      p.UNIT_PRICE AS UNIT_PRICE,
+      p.WAREHOUSE_ID AS WAREHOUSE_ID
+  FROM DPM_SRC_INVENTORY.SILVER.PRODUCTS p
+  WHERE p.PRODUCT_ID IN (SELECT PRODUCT_ID FROM DPM_SRC_INVENTORY.SILVER.PRODUCTS_STREAM)
+) src
+ON tgt.PRODUCT_ID = src.PRODUCT_ID
+WHEN MATCHED THEN UPDATE SET
+  PRODUCT_NAME = src.PRODUCT_NAME, CATEGORY = src.CATEGORY, UNIT_PRICE = src.UNIT_PRICE,
+  WAREHOUSE_ID = src.WAREHOUSE_ID, UPDATED_AT = CURRENT_TIMESTAMP()
+WHEN NOT MATCHED THEN INSERT (PRODUCT_ID, PRODUCT_NAME, CATEGORY, UNIT_PRICE, WAREHOUSE_ID, UPDATED_AT)
+  VALUES (src.PRODUCT_ID, src.PRODUCT_NAME, src.CATEGORY, src.UNIT_PRICE, src.WAREHOUSE_ID, CURRENT_TIMESTAMP());
+create or replace task DPM_CUSTOMER_360.GOLD.TASK_SILVER_TO_GOLD_TRANSACTION
+	warehouse=DPM_PIPELINE_WH
+	schedule='1 MINUTE'
+	when SYSTEM$STREAM_HAS_DATA('DPM_SRC_BILLING.SILVER.INVOICES_STREAM')
+	as MERGE INTO DPM_CUSTOMER_360.GOLD.TRANSACTION tgt
+USING (
+  SELECT
+      i.INVOICE_ID AS TRANSACTION_ID,
+      x.INDIVIDUAL_ID AS INDIVIDUAL_ID,
+      i.PRODUCT_ID AS PRODUCT_ID,
+      i.AMOUNT AS AMOUNT,
+      i.STATUS AS STATUS,
+      i.INVOICE_DATE AS TRANSACTION_DATE
+  FROM DPM_SRC_BILLING.SILVER.INVOICES i
+  -- A LEFT join on purpose. An invoice whose customer did not resolve still
+  -- belongs in the 360 - dropping it would hide lost revenue by making the
+  -- table smaller, which is the quietest possible failure. It lands with a
+  -- null INDIVIDUAL_ID instead, where the referential-integrity check can see
+  -- it and say so.
+  LEFT JOIN DPM_CUSTOMER_360.IDENTITY.INDIVIDUAL_XREF x
+    ON x.SOURCE_SYSTEM = 'CRM' AND x.SOURCE_ID = TO_VARCHAR(i.CUSTOMER_ID)
+  WHERE i.INVOICE_ID IN (SELECT INVOICE_ID FROM DPM_SRC_BILLING.SILVER.INVOICES_STREAM)
+) src
+ON tgt.TRANSACTION_ID = src.TRANSACTION_ID
+WHEN MATCHED THEN UPDATE SET
+  INDIVIDUAL_ID = src.INDIVIDUAL_ID, PRODUCT_ID = src.PRODUCT_ID, AMOUNT = src.AMOUNT,
+  STATUS = src.STATUS, TRANSACTION_DATE = src.TRANSACTION_DATE, UPDATED_AT = CURRENT_TIMESTAMP()
+WHEN NOT MATCHED THEN INSERT (
+  TRANSACTION_ID, INDIVIDUAL_ID, PRODUCT_ID, AMOUNT, STATUS, TRANSACTION_DATE, UPDATED_AT
+) VALUES (
+  src.TRANSACTION_ID, src.INDIVIDUAL_ID, src.PRODUCT_ID, src.AMOUNT, src.STATUS,
+  src.TRANSACTION_DATE, CURRENT_TIMESTAMP()
+);
